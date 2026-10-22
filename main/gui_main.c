@@ -180,14 +180,14 @@ void init_passport_main_gui(void) {
     date_label = lv_label_create(scr);
     lv_obj_set_style_text_font(date_label, &lv_font_montserrat_20, 0);       // 🚀 加大字体至 20号
     lv_obj_set_style_text_color(date_label, lv_color_make(0, 200, 50), 0);  // 稍暗绿色的日期
-    lv_obj_set_style_text_opa(date_label, LV_OPA_85, 0);
+    lv_obj_set_style_text_opa(date_label, LV_OPA_90, 0);
     lv_obj_align(date_label, LV_ALIGN_CENTER, 0, 15);                       // 屏幕中央偏下
 
     // --- 3) 星期几 Label (新增，20号字) ---
     week_label = lv_label_create(scr);
     lv_obj_set_style_text_font(week_label, &lv_font_montserrat_20, 0);       // 🚀 新增星期 Label，20号字
     lv_obj_set_style_text_color(week_label, lv_color_make(0, 200, 50), 0);  // 骇客绿
-    lv_obj_set_style_text_opa(week_label, LV_OPA_80, 0);
+    lv_obj_set_style_text_opa(week_label, LV_OPA_90, 0);
     lv_obj_align(week_label, LV_ALIGN_CENTER, 0, 45);                       // 位于日期正下方
 
     // 5. 初始化所有雨滴
