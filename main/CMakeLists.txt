@@ -2,6 +2,7 @@
 idf_component_register(SRCS "main.c"
                             "connections.c"
                             "gui_main.c"
+                            "gui_main_web.c"
                             "lv_font_pixel_hacker_16.c"
                             "lv_font_pixel_hacker_20.c"
                             "lv_font_pixel_hacker_24.c"
