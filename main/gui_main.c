@@ -66,10 +66,17 @@ static void update_time_display(void) {
     char date_str[32];
     char week_str[32];
 
-    // 格式化时间、日期与星期
+// 格式化时间与日期
     snprintf(time_str, sizeof(time_str), "%02d:%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
     snprintf(date_str, sizeof(date_str), "%04d-%02d-%02d", timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday);
-    strftime(week_str, sizeof(week_str), "%A", &timeinfo); // 获取完整星期名称，例如 "Thursday"
+
+    // 🚀 定义英文大写星期简写映射表 (tm_wday: 0=周日, 1=周一, ..., 6=周六)
+    const char *week_days_en[] = {"SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"};
+    if (timeinfo.tm_wday >= 0 && timeinfo.tm_wday <= 6) {
+        snprintf(week_str, sizeof(week_str), "%s", week_days_en[timeinfo.tm_wday]);
+    } else {
+        snprintf(week_str, sizeof(week_str), "UNK");
+    }
 
     if (time_label) {
         lv_label_set_text(time_label, time_str);
