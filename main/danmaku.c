@@ -22,6 +22,7 @@ static const char* TAG = "DANMAKU";
 #define DK_NVS_NS    "matrix_cfg"
 #define DK_KEY_URL   "danmaku_url"
 #define DK_KEY_ON    "danmaku_on"
+#define DK_KEY_EN    "danmaku_enabled"   /* 弹幕接收总开关，默认关闭 */
 
 #define DK_RECV_BUF  2048            /* 单帧接收缓冲 */
 #define DK_TASK_STACK 6144
@@ -141,6 +142,7 @@ static SemaphoreHandle_t s_mtx = NULL;
 static char  s_url[DANMAKU_URL_MAX] = {0};
 static int   s_state = DANMAKU_STATE_IDLE;
 static bool  s_onscreen = true;
+static bool  s_enabled = false;   /* 弹幕接收总开关：默认关闭，需在网页端手动打开 */
 static volatile bool s_url_dirty = false;
 
 /* 环形历史（供网页查看） + 消费型待显示队列（供屏幕滚动） */
@@ -281,7 +283,7 @@ static bool ws_open(ws_conn_t* c, const ws_url_t* u) {
         if (!c->tls_h) return false;
         int r = esp_tls_conn_new_sync(u->host, (int)strlen(u->host), u->port, &cfg, c->tls_h);
         if (r != 1) {
-            ESP_LOGW(TAG, "TLS 连接失败: %d", r);
+            ESP_LOGD(TAG, "TLS 连接失败: %d", r);
             ws_close(c);
             return false;
         }
@@ -293,10 +295,10 @@ static bool ws_open(ws_conn_t* c, const ws_url_t* u) {
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_STREAM;
-    char portstr[8];
+    char portstr[16];
     snprintf(portstr, sizeof(portstr), "%d", u->port);
     if (getaddrinfo(u->host, portstr, &hints, &res) != 0 || !res) {
-        ESP_LOGW(TAG, "域名解析失败: %s", u->host);
+        ESP_LOGD(TAG, "域名解析失败: %s", u->host);
         return false;
     }
     c->fd = socket(res->ai_family, res->ai_socktype, 0);
@@ -310,7 +312,7 @@ static bool ws_open(ws_conn_t* c, const ws_url_t* u) {
     int rc = connect(c->fd, res->ai_addr, res->ai_addrlen);
     freeaddrinfo(res);
     if (rc != 0) {
-        ESP_LOGW(TAG, "TCP 连接失败: errno=%d", errno);
+        ESP_LOGD(TAG, "TCP 连接失败: errno=%d", errno);
         ws_close(c);
         return false;
     }
@@ -400,7 +402,7 @@ static bool ws_handshake(ws_conn_t* c, const ws_url_t* u) {
     if (!strstr(resp, "\r\n\r\n")) return false;
     if (strncmp(resp, "HTTP/1.1 101", 12) != 0 &&
         strncmp(resp, "HTTP/1.0 101", 12) != 0) {
-        ESP_LOGW(TAG, "握手被服务器拒绝: %.48s", resp);
+        ESP_LOGD(TAG, "握手被服务器拒绝: %.48s", resp);
         return false;
     }
 
@@ -409,11 +411,11 @@ static bool ws_handshake(ws_conn_t* c, const ws_url_t* u) {
     if (!ws_expected_accept(key, expect, sizeof(expect))) return false;
     char accept_val[64];
     if (!ws_header_value(resp, "Sec-WebSocket-Accept", accept_val, sizeof(accept_val))) {
-        ESP_LOGW(TAG, "响应缺少 Sec-WebSocket-Accept 头，放弃连接");
+        ESP_LOGD(TAG, "响应缺少 Sec-WebSocket-Accept 头，放弃连接");
         return false;
     }
     if (strcmp(accept_val, expect) != 0) {
-        ESP_LOGW(TAG, "握手校验失败: 期望 %s，收到 %s", expect, accept_val);
+        ESP_LOGD(TAG, "握手校验失败: 期望 %s，收到 %s", expect, accept_val);
         return false;
     }
     return true;
@@ -476,7 +478,7 @@ static int ws_read_message(ws_conn_t* c, char* out, size_t out_len) {
         if (masked && ws_read_exact(c, mask, 4) != 4) return -1;
 
         if (plen > sizeof(s_frame_acc)) {
-            ESP_LOGW(TAG, "单帧过大(%u 字节)，丢弃", (unsigned)plen);
+            ESP_LOGD(TAG, "单帧过大(%u 字节)，丢弃", (unsigned)plen);
             return -1;
         }
 
@@ -693,12 +695,21 @@ static void danmaku_task(void* arg) {
     (void)arg;
     ESP_LOGI(TAG, "弹幕接收任务已启动");
 
+    int fail_cnt = 0;   /* 连续失败计数：用于日志节流，避免串口被重试信息刷屏 */
+
     for (;;) {
         char url[DANMAKU_URL_MAX];
         xSemaphoreTake(s_mtx, portMAX_DELAY);
         strncpy(url, s_url, sizeof(url) - 1);
         url[sizeof(url) - 1] = 0;
         xSemaphoreGive(s_mtx);
+
+        if (!s_enabled) {
+            /* 总开关关闭：不解析地址、不建连、不产生任何网络请求 */
+            dk_set_state(DANMAKU_STATE_IDLE);
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
 
         if (url[0] == 0) {
             dk_set_state(DANMAKU_STATE_IDLE);
@@ -721,7 +732,13 @@ static void danmaku_task(void* arg) {
         if (!ws_open(&c, &u) || !ws_handshake(&c, &u)) {
             ws_close(&c);
             dk_set_state(DANMAKU_STATE_ERROR);
-            ESP_LOGW(TAG, "连接或握手失败，%d 秒后重试", DK_RETRY_MS / 1000);
+            /* 日志节流：每 5 次失败才打一行汇总（首次必打），避免刷屏。
+               具体失败原因已由底层 ESP_LOGD 记录，需要排查时把日志级别开到 DEBUG 即可。 */
+            fail_cnt++;
+            if (fail_cnt == 1 || fail_cnt % 5 == 0) {
+                ESP_LOGW(TAG, "弹幕服务器连接失败 %d 次（地址 %s），%d 秒后重试",
+                         fail_cnt, url, DK_RETRY_MS / 1000);
+            }
             for (int i = 0; i < DK_RETRY_MS / 100 && !s_url_dirty; i++) vTaskDelay(pdMS_TO_TICKS(100));
             s_url_dirty = false;
             continue;
@@ -729,6 +746,7 @@ static void danmaku_task(void* arg) {
 
         ESP_LOGI(TAG, "WebSocket 已连接，等待弹幕");
         dk_set_state(DANMAKU_STATE_CONNECTED);
+        fail_cnt = 0;
         s_url_dirty = false;
 
         while (!s_url_dirty) {
@@ -748,7 +766,10 @@ static void danmaku_task(void* arg) {
 
         if (!s_url_dirty) {
             dk_set_state(DANMAKU_STATE_OFFLINE);
-            ESP_LOGW(TAG, "连接断开，%d 秒后重连", DK_RETRY_MS / 1000);
+            fail_cnt++;
+            if (fail_cnt == 1 || fail_cnt % 5 == 0) {
+                ESP_LOGW(TAG, "弹幕连接断开 %d 次，%d 秒后重连", fail_cnt, DK_RETRY_MS / 1000);
+            }
             for (int i = 0; i < DK_RETRY_MS / 100 && !s_url_dirty; i++) vTaskDelay(pdMS_TO_TICKS(100));
         }
         s_url_dirty = false;
@@ -761,11 +782,23 @@ static void danmaku_task(void* arg) {
 static void dk_load_nvs(void) {
     nvs_handle_t h;
     s_url[0] = 0;
+    s_enabled = false;              /* 读不到开关记录时也保持"默认关闭" */
     if (nvs_open(DK_NVS_NS, NVS_READONLY, &h) == ESP_OK) {
         size_t len = sizeof(s_url);
         if (nvs_get_str(h, DK_KEY_URL, s_url, &len) != ESP_OK) s_url[0] = 0;
         int8_t on = 1;
         if (nvs_get_i8(h, DK_KEY_ON, &on) == ESP_OK) s_onscreen = (on != 0);
+        int8_t en = 0;
+        if (nvs_get_i8(h, DK_KEY_EN, &en) == ESP_OK) s_enabled = (en != 0);
+        nvs_close(h);
+    }
+}
+
+static void dk_save_enabled_nvs(bool en) {
+    nvs_handle_t h;
+    if (nvs_open(DK_NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_i8(h, DK_KEY_EN, en ? 1 : 0);
+        nvs_commit(h);
         nvs_close(h);
     }
 }
@@ -811,8 +844,21 @@ bool danmaku_set_url(const char* url) {
 
     dk_save_url_nvs(s_url);
     s_url_dirty = true;   /* 通知接收任务立即按新地址重连 */
-    ESP_LOGI(TAG, "弹幕地址已更新: %s", s_url[0] ? s_url : "(空，已停止接收)");
+    ESP_LOGI(TAG, "弹幕地址已更新: %s (总开关 %s)", s_url[0] ? s_url : "(空)",
+             s_enabled ? "开" : "关");
     return true;
+}
+
+/* ---- 弹幕接收总开关：默认关闭，只有打开后才建立 WebSocket 连接 ---- */
+bool danmaku_get_enabled(void) { return s_enabled; }
+
+void danmaku_set_enabled(bool on) {
+    if (s_mtx) xSemaphoreTake(s_mtx, portMAX_DELAY);
+    s_enabled = on;
+    if (s_mtx) xSemaphoreGive(s_mtx);
+    dk_save_enabled_nvs(on);
+    s_url_dirty = true;   /* 让接收任务立刻按新的开关状态生效（打开即连 / 关闭即断） */
+    ESP_LOGI(TAG, "弹幕接收总开关: %s", on ? "打开" : "关闭");
 }
 
 const char* danmaku_get_url(void) { return s_url; }
@@ -834,7 +880,7 @@ bool danmaku_poll(char* out, size_t out_len) {
     if (s_shown < s_total) {
         if (s_total - s_shown > (unsigned)DANMAKU_QUEUE_LEN)
             s_shown = s_total - DANMAKU_QUEUE_LEN;
-        snprintf(out, out_len, "%s", s_hist[s_shown % DANMAKU_QUEUE_LEN].text);
+        strlcpy(out, s_hist[s_shown % DANMAKU_QUEUE_LEN].text, out_len);
         s_shown++;
         ok = true;
     }
@@ -847,7 +893,7 @@ bool danmaku_get_by_seq(unsigned seq, char* out, size_t out_len) {
     if (!s_mtx || !out || out_len == 0) return false;
     xSemaphoreTake(s_mtx, portMAX_DELAY);
     if (seq < s_total && (s_total - seq) <= (unsigned)DANMAKU_QUEUE_LEN) {
-        snprintf(out, out_len, "%s", s_hist[seq % DANMAKU_QUEUE_LEN].text);
+        strlcpy(out, s_hist[seq % DANMAKU_QUEUE_LEN].text, out_len);
         ok = true;
     }
     xSemaphoreGive(s_mtx);

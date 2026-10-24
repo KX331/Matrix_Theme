@@ -36,6 +36,16 @@ bool danmaku_set_url(const char* url);
 /** 当前保存的地址（未配置时为空串） */
 const char* danmaku_get_url(void);
 
+/**
+ * @brief 弹幕接收总开关（默认关闭）
+ *
+ * 关闭时不解析地址、不建立任何连接、不产生网络请求；
+ * 打开后才会按 danmaku_get_url() 返回的地址开始接收。
+ * 开关状态持久化在 NVS，重启后保持。
+ */
+bool danmaku_get_enabled(void);
+void danmaku_set_enabled(bool on);
+
 /** 是否把弹幕滚动显示到设备屏幕 */
 bool danmaku_get_onscreen(void);
 void danmaku_set_onscreen(bool on);
